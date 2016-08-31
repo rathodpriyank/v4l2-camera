@@ -8,11 +8,20 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #include "media.h"
+#include "msm_cam_sensor.h"
+
 uint8_t *buffer;
 
+#define QCAMERA_VNODE_GROUP_ID			2
+#define MSM_CAMERA_SUBDEV_SENSOR_INIT 	14
+#define MSM_CAMERA_EVENT_MIN			0
+#define MSM_CAMERA_EVENT_MAX			8
+#define MSM_CAMERA_V4L2_EVENT_TYPE (V4L2_EVENT_PRIVATE_START + 0x00002000)
+
+// generics
 #define DEF_NODE "/dev/video1"
-#define QCAMERA_VNODE_GROUP_ID	2
 #define MAX_DEV_NAME_SIZE 32
+
 
 static int xioctl(int fd, int request, void *arg)
 {
@@ -177,6 +186,8 @@ int capture_image(int fd)
     return 0;
 }
 
+
+
 int probe_media(char *node_name)
 {
 	char dev_name[MAX_DEV_NAME_SIZE];
@@ -241,9 +252,107 @@ int probe_media(char *node_name)
 	return 0;
 }
 
+int probe_subdev(char *node_name)
+{
+	char dev_name[MAX_DEV_NAME_SIZE];
+	int dev_fd = 0;
+	int rc = 0;
+	struct media_device_info mdev_info;
+	struct media_entity_desc entity;
+	int num_entities = 0;
+	int num_media_devices = 0;
+
+	while (1) 
+	{
+		printf("num_media_devices : %d \n", num_media_devices);
+		snprintf(dev_name, sizeof(dev_name), "/dev/media%d", num_media_devices++);
+		dev_fd = open(dev_name, O_RDWR | O_NONBLOCK);
+		if (dev_fd == -1)
+		{
+		    printf("Opening video device failed : %s\n", dev_name);		
+			return 1;
+		}
+		
+		rc = ioctl(dev_fd, MEDIA_IOC_DEVICE_INFO, &mdev_info);
+		if (rc < 0) 
+		{
+		  close(dev_fd);
+		  return 1;
+		}
+		
+		if (strncmp(mdev_info.model, "msm_config", sizeof(mdev_info.model)) != 0)
+		{
+			printf("msm_config is not matching\n");
+			continue;
+		}
+		else
+		{
+			printf("msm_config is matching with : %s from %s \n", mdev_info.model, dev_name);
+		}
+	
+		num_entities = 1;
+		while (1) 
+		{
+			memset(&entity, 0, sizeof(entity));
+			entity.id = num_entities++;
+			rc = ioctl(dev_fd, MEDIA_IOC_ENUM_ENTITIES, &entity);
+			if (rc < 0) 
+			{
+				rc = 0;
+				break;
+			}
+		
+			printf("entity name %s type %d group id %d\n",entity.name, entity.type, entity.group_id);
+		if (entity.type == MEDIA_ENT_T_V4L2_SUBDEV &&
+		      entity.group_id == MSM_CAMERA_SUBDEV_SENSOR_INIT) 
+			{
+				/* found the video device */
+				strncpy(node_name, entity.name, MAX_DEV_NAME_SIZE);
+				printf("Copied the %s node from entity\n", node_name);
+				close(dev_fd);
+				return 0;
+			}
+		}
+	}
+	return 0;
+}
+
+int subscription(int fd)
+{
+	struct v4l2_event_subscription subscribe;
+	int i = 0;
+	
+	// starting to the process
+	memset(&subscribe, 0, sizeof(struct v4l2_event_subscription));
+	
+	subscribe.type = MSM_CAMERA_V4L2_EVENT_TYPE;
+	for (i = MSM_CAMERA_EVENT_MIN + 1; i < MSM_CAMERA_EVENT_MAX; i++) 
+	{
+		subscribe.id = i;
+		if (ioctl(fd, VIDIOC_SUBSCRIBE_EVENT, &subscribe) < 0)
+			return -1;
+	}
+	return 0;
+}
+
+int open_subdev_cam(int fd)
+{
+ 	struct sensor_init_cfg_data cfg;
+ 	cfg.cfgtype = 1;
+ 	if (-1 == xioctl(fd, VIDIOC_MSM_SENSOR_INIT_CFG, &cfg))
+ 	{
+ 		printf("Probe failed\n");
+ 		return -1;
+ 	}	
+ 	else
+ 		printf("Waiting the camera to start ... \n");
+	return 0;
+}
+
 int main( int argc, char * argv [] ) 
 {
         int fd;
+        int probe_done_fd;
 		char node_name[MAX_DEV_NAME_SIZE];
 		char probed_node[MAX_DEV_NAME_SIZE];
 		char dev_name[MAX_DEV_NAME_SIZE];
@@ -274,6 +383,24 @@ int main( int argc, char * argv [] )
         else
         	printf("Device %s opened\n", node_name);
 
+		if(subscription(fd))
+            return 1;
+
+		memset(probed_node, '\0', MAX_DEV_NAME_SIZE);
+		probe_subdev(probed_node);
+		snprintf(dev_name, sizeof(dev_name), "/dev/%s", probed_node);
+		fd = open(dev_name, O_RDWR);
+        if (probe_done_fd == -1)
+        {
+			perror("Opening video subdev failed\n");
+			return 1;
+        }
+        else
+        	printf("Subdev %s opened\n", dev_name);
+
+		if (open_subdev_cam(probe_done_fd) == -1)
+			return 1;
+			
         if(print_caps(fd))
             return 1;
 
